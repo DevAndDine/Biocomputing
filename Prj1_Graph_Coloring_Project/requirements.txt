@@ -1,0 +1,2 @@
+# Project 01 autograder is self-contained.
+# A lightweight DEAP-compatible shim is bundled in /autograder/source/deap.

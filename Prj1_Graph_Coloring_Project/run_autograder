@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import traceback
+
+SOURCE_DIR = Path(os.environ.get("AUTOGRADER_SOURCE_DIR", "/autograder/source")).resolve()
+SUBMISSION_DIR = Path(os.environ.get("AUTOGRADER_SUBMISSION_DIR", "/autograder/submission")).resolve()
+RESULTS_DIR = Path(os.environ.get("AUTOGRADER_RESULTS_DIR", "/autograder/results")).resolve()
+
+TESTS = []
+
+
+def test(name, max_score):
+    def decorator(func):
+        TESTS.append((name, max_score, func))
+        return func
+    return decorator
+
+
+def write_results(score, tests, extra_output=""):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "score": score,
+        "visibility": "visible",
+        "stdout_visibility": "visible",
+        "tests": tests,
+    }
+    (RESULTS_DIR / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    lines = []
+    if extra_output:
+        lines.append(extra_output)
+    for item in tests:
+        status = "PASS" if item["score"] == item["max_score"] else "FAIL"
+        lines.append(f"{status}: {item['name']} ({item['score']}/{item['max_score']})")
+        if item.get("output"):
+            lines.append(f"  {item['output']}")
+    (RESULTS_DIR / "results.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def find_submission_file():
+    preferred = ["student_solution.py", "P01_solution.py"]
+    for filename in preferred:
+        candidate = SUBMISSION_DIR / filename
+        if candidate.is_file():
+            return candidate
+
+    py_files = sorted(
+        path for path in SUBMISSION_DIR.glob("*.py")
+        if path.name not in {"__init__.py"}
+    )
+    if len(py_files) == 1:
+        return py_files[0]
+    if not py_files:
+        raise AssertionError(
+            "No Python submission file found. Submit student_solution.py. "
+            "P01_solution.py is also accepted for compatibility."
+        )
+    names = ", ".join(path.name for path in py_files)
+    raise AssertionError(
+        "Multiple Python files were submitted, so the autograder cannot choose the solution file. "
+        f"Submit exactly one solution file, preferably student_solution.py. Found: {names}"
+    )
+
+
+_CACHED_STUDENT_MODULE = None
+
+
+def load_student_module():
+    global _CACHED_STUDENT_MODULE
+    if _CACHED_STUDENT_MODULE is not None:
+        return _CACHED_STUDENT_MODULE
+
+    submission_file = find_submission_file().resolve()
+    try:
+        submission_file.relative_to(SUBMISSION_DIR)
+    except ValueError as exc:
+        raise AssertionError("The solution file must come from the submitted files, not the autograder source.") from exc
+
+    # Make bundled dependencies and local graph paths available without allowing a
+    # student_solution.py from the source directory to shadow the submitted file.
+    for path in [str(SOURCE_DIR), str(SUBMISSION_DIR)]:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+    spec = importlib.util.spec_from_file_location("student_solution_under_test", submission_file)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["student_solution_under_test"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    _CACHED_STUDENT_MODULE = module
+    return module
+
+
+def adjacency_list(graph, node):
+    result = []
+    temp = graph.graph[node]
+    seen_guard = 0
+    while temp is not None:
+        result.append(temp.vertex)
+        temp = temp.next
+        seen_guard += 1
+        if seen_guard > 10000:
+            raise AssertionError("Adjacency list appears to contain a cycle.")
+    return sorted(result)
+
+
+def assert_close(actual, expected, tol=1e-9):
+    if abs(actual - expected) > tol:
+        raise AssertionError(f"Expected {expected}, got {actual}")
+
+
+@test("Q1: init_graph builds the graph correctly", 30)
+def grade_q1():
+    student = load_student_module()
+    if not hasattr(student, "init_graph"):
+        raise AssertionError("Missing required function init_graph(file_path).")
+    graph = student.init_graph(str(SOURCE_DIR / "graphs" / "graph_1.txt"))
+    if graph.n != 4:
+        raise AssertionError(f"graph.n should be 4 for graph_1.txt, got {graph.n!r}.")
+    if graph.k != 3:
+        raise AssertionError(f"graph.k should be 3 for graph_1.txt, got {graph.k!r}.")
+    if adjacency_list(graph, 0) != [2]:
+        raise AssertionError(f"Vertex 0 should be adjacent to [2], got {adjacency_list(graph, 0)!r}.")
+    if adjacency_list(graph, 1) != [2, 3]:
+        raise AssertionError(f"Vertex 1 should be adjacent to [2, 3], got {adjacency_list(graph, 1)!r}.")
+    if adjacency_list(graph, 2) != [0, 1]:
+        raise AssertionError(f"Vertex 2 should be adjacent to [0, 1], got {adjacency_list(graph, 2)!r}.")
+    if adjacency_list(graph, 3) != [1]:
+        raise AssertionError(f"Vertex 3 should be adjacent to [1], got {adjacency_list(graph, 3)!r}.")
+
+
+@test("Q2: eval_graph scores valid, invalid, and partial colorings", 35)
+def grade_q2():
+    student = load_student_module()
+    for name in ["init_graph", "eval_graph"]:
+        if not hasattr(student, name):
+            raise AssertionError(f"Missing required function {name}.")
+
+    graph = student.init_graph(str(SOURCE_DIR / "graphs" / "graph_1.txt"))
+
+    perfect = [0, 0, 0, 0, 0, 1, 1, 0]
+    invalid = [1, 1, 0, 0, 0, 1, 1, 0]
+    partial = [0, 0, 0, 1, 0, 1, 1, 0]
+
+    perfect_score = student.eval_graph(graph, perfect)
+    invalid_score = student.eval_graph(graph, invalid)
+    partial_score = student.eval_graph(graph, partial)
+
+    if not isinstance(perfect_score, tuple) or len(perfect_score) != 1:
+        raise AssertionError("eval_graph must return a one-element tuple such as (1.0,).")
+    assert_close(float(perfect_score[0]), 1.0)
+    assert_close(float(invalid_score[0]), 0.0)
+    assert_close(float(partial_score[0]), 2.0 / 3.0)
+
+
+@test("Q3: run_ga returns a high best fitness", 35)
+def grade_q3():
+    student = load_student_module()
+    if not hasattr(student, "run_ga"):
+        raise AssertionError("Missing required function run_ga(file_path, population_size, ngen, cxpb, mutpb).")
+    fitness = student.run_ga(str(SOURCE_DIR / "graphs" / "graph_3.txt"), population_size=200, ngen=100)
+    if not isinstance(fitness, (int, float)):
+        raise AssertionError(f"run_ga must return a numeric fitness value, got {type(fitness).__name__}.")
+    if math.isnan(float(fitness)):
+        raise AssertionError("run_ga returned NaN.")
+    if float(fitness) < 0.90:
+        raise AssertionError(f"Expected run_ga to find fitness >= 0.90 on graph_3.txt, got {fitness}.")
+
+
+def main():
+    os.chdir(SOURCE_DIR)
+    tests = []
+    total = 0.0
+    for name, max_score, func in TESTS:
+        try:
+            func()
+            earned = float(max_score)
+            output = "Passed"
+        except Exception as exc:
+            earned = 0.0
+            output = f"{type(exc).__name__}: {exc}"
+            tb = traceback.format_exc(limit=3)
+            output = output + "\n" + tb
+        tests.append({
+            "score": earned,
+            "max_score": float(max_score),
+            "name": name,
+            "output": output,
+            "visibility": "visible",
+        })
+        total += earned
+    write_results(total, tests)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
